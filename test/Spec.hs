@@ -53,7 +53,7 @@ mkPool = do
     ciRetries = 0
     mkDetails = CDDatabaseURI
     logger = mempty
-    connParams = ConnParams 1 1 60 True Nothing (Just 3)
+    connParams = ConnParams 1 1 60 True Nothing (Just 3) False
 
 withFreshPool :: (FromPGTxErr e, FromPGConnErr e) => PGPool -> IO a -> IO (Either e a)
 withFreshPool pool action =

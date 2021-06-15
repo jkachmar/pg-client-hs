@@ -55,15 +55,29 @@ specTimeout = before initDB $ do
       diffUTCTime t1 t0 `shouldSatisfy` (\x -> x >= 0.5 && x < 0.75)
       -- but the insert went through
       countRows pool `shouldReturn` 1
+    it "is interrupted promptly with cancelling" $ \pool -> do
+      cancelablePool <- mkPool True
+      countRows pool `shouldReturn` 0
+      t0 <- getCurrentTime
+      res <- timeout 500000 $ sleepyInsert cancelablePool 1
+      t1 <- getCurrentTime
+      -- didn't time out, instead returned properly with a cancel error
+      res `shouldSatisfy` (\case
+        Just (Left err) -> isCancelErr err
+        _               -> False)
+      -- promptly
+      diffUTCTime t1 t0 `shouldSatisfy` (\x -> x >= 0.5 && x < 0.75)
+      -- insert was rolled back
+      countRows pool `shouldReturn` 0
 
-mkPool :: IO PGPool
-mkPool = do
+mkPool :: Bool -> IO PGPool
+mkPool cancelable = do
   dbUri <- BS.pack <$> Env.getEnv "DATABASE_URL"
   initPGPool (connInfo dbUri) connParams logger
   where
     ciRetries = 0
     connInfo uri = ConnInfo { ciRetries, ciDetails = CDDatabaseURI uri }
-    connParams = ConnParams 1 1 60 True Nothing (Just 3)
+    connParams = ConnParams 1 1 60 True Nothing (Just 3) cancelable
     logger = mempty
 
 mode :: (TxIsolation, Maybe TxAccess)
@@ -71,7 +85,7 @@ mode = (Serializable, Just ReadWrite)
 
 initDB :: IO PGPool
 initDB = do
-  pool <- mkPool
+  pool <- mkPool False
   let tx = multiQE PGExecErrTx (fromText statements)
   res <- runExceptT $ runTx pool mode tx
   res `shouldBe` Right ()
@@ -102,3 +116,8 @@ sleepyInsert pool sleep =
   where
     query = "INSERT INTO test_timeout VALUES (sleepy($1))"
     tx = withQE PGExecErrTx (fromText query) (Identity sleep) False
+
+isCancelErr :: PGExecErr -> Bool
+isCancelErr err = case err of
+  PGExecErrTx (PGTxErr _msg _ _ _) -> True -- fixme
+  _                                -> False

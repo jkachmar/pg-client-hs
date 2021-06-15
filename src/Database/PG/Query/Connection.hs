@@ -1,7 +1,9 @@
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE TupleSections              #-}
 
@@ -37,6 +39,7 @@ module Database.PG.Query.Connection
     , PGStmtErrDetail(..)
     ) where
 
+import           Control.Concurrent.Async
 import           Control.Exception
 import           Control.Monad.Except
 import           Data.Aeson
@@ -50,6 +53,7 @@ import           Data.Time
 import           Data.Word
 import           GHC.Exts
 import           GHC.Generics
+import           System.Timeout
 
 import qualified Control.Retry             as CR
 import qualified Data.ByteString           as DB
@@ -280,7 +284,7 @@ retryOnConnErr pgConn action =
       Left (Right pgConnErr) -> return $ Left pgConnErr
   where
     resetFn = resetPGConn pgConn
-    PGConn _ _ retryP logger _ _ _ _ = pgConn
+    PGConn _ _ _ retryP logger _ _ _ _ = pgConn
 
 checkResult
   :: PQ.Connection
@@ -365,20 +369,48 @@ execPrepared
   :: PQ.Connection                -- ^ connection
   -> [Maybe (DB.ByteString, PQ.Format)]           -- ^ parameters
   -> RemoteKey                    -- ^ stmtName
+  -> ((PQ.Connection -> IO (Maybe PQ.Result)) -> PQ.Connection -> IO (Maybe PQ.Result))
   -> PGExec ResultOk -- ^ result
-execPrepared conn args n = do
-  mRes <- lift $ PQ.execPrepared conn n args PQ.Binary
+execPrepared conn args n run = do
+  mRes <- lift $ run (\c -> PQ.execPrepared c n args PQ.Binary) conn
   checkResult conn mRes
+
+data PGCancelErr = CEAllocate | CEError DT.Text
+  deriving (Show, Eq)
+
+instance Exception PGCancelErr
+
+cancelPG :: PQ.Connection -> IO (Either PGCancelErr ())
+cancelPG conn = do
+  PQ.getCancel conn >>= \case
+    Nothing -> return $ Left CEAllocate
+    Just c  -> PQ.cancel c >>= \case
+      Left err -> return $ Left $ CEError $ lenientDecodeUtf8 err
+      Right () -> return $ Right ()
+
+cancelOnTimeout :: (PQ.Connection -> IO a) -> PQ.Connection -> IO a
+cancelOnTimeout f conn = do
+  a <- async $ f conn
+  x <- (Left <$> wait a) `catch`
+    (\(e::Timeout) -> Right <$> do
+        cancelPG conn >>= \case
+          Left err -> return $ Left (err, e)
+          Right () -> return $ Right ())
+  case x of
+    Left res               -> return res
+    Right (Left (err, _e)) -> throw err -- very unclear this is correct, just want to avoid losing the error for now
+    Right (Right ())       -> wait a
 
 -- Prevents a class of SQL injection attacks
 execParams
   :: PQ.Connection                 -- ^ connection
   -> Template                      -- ^ statement
   -> [(PQ.Oid, Maybe (DB.ByteString, PQ.Format))]  -- ^ parameters
+  -> ((PQ.Connection -> IO (Maybe PQ.Result)) -> PQ.Connection -> IO (Maybe PQ.Result))
   -> PGExec ResultOk  -- ^ result
-execParams conn (Template t) params = do
+execParams conn (Template t) params run = do
   let params' = map (\(ty, v) -> prependToTuple2 ty <$> v) params
-  mRes <- lift $ PQ.execParams conn t params' PQ.Binary
+  mRes <- lift $ run (\c -> PQ.execParams c t params' PQ.Binary) conn
   checkResult conn mRes
   where
     prependToTuple2 a (b, c) = (a, b, c)
@@ -398,6 +430,7 @@ data PGConn
   = PGConn
   { pgPQConn       :: !PQ.Connection
   , pgAllowPrepare :: !Bool
+  , pgCancel       :: !Bool
   , pgRetryPolicy  :: !PGRetryPolicy
   , pgLogger       :: !PGLogger
   , pgCounter      :: !(IORef Word16)
@@ -408,7 +441,7 @@ data PGConn
   }
 
 resetPGConn :: PGConn -> IO ()
-resetPGConn (PGConn conn _ _ _ ctr ht _ _) = do
+resetPGConn (PGConn conn _ _ _ _ ctr ht _ _) = do
   -- Reset LibPQ connection
   PQ.reset conn
   -- Set counter to 0
@@ -453,7 +486,7 @@ prepare
   -> Template
   -> [PQ.Oid]
   -> PGExec RemoteKey
-prepare (PGConn conn _ _ _ counter table _ _) t tl = do
+prepare (PGConn conn _ _ _ _ counter table _ _) t tl = do
   let lk      = localKey t tl
   rkm <- lift $ HI.lookup table lk
   case rkm of
@@ -502,13 +535,13 @@ execQuery pgConn pgQuery = do
     bool withoutPrepare withPrepare $ allowPrepare && preparable
   withExceptT PGIUnexpected $ convF resOk
   where
-    PGConn conn allowPrepare _ _ _ _ _ _ = pgConn
+    PGConn conn allowPrepare cancelable _ _ _ _ _ _ = pgConn
     PGQuery t params preparable convF = pgQuery
-    withoutPrepare = execParams conn t params
+    withoutPrepare = execParams conn t params (bool id cancelOnTimeout cancelable)
     withPrepare = do
       let (tl, vl) = unzip params
       rk <- prepare pgConn t tl
-      execPrepared conn vl rk
+      execPrepared conn vl rk (bool id cancelOnTimeout cancelable)
 
 {-# INLINE execMulti #-}
 execMulti
