@@ -398,7 +398,7 @@ cancelOnTimeout f conn = do
           Right () -> return $ Right ())
   case x of
     Left res               -> return res
-    Right (Left (err, _e)) -> throw err -- very unclear this is correct, just want to avoid losing the error for now
+    Right (Left (err, _e)) -> throwIO err -- very unclear this is correct, just want to avoid losing the error for now
     Right (Right ())       -> wait a
 
 -- Prevents a class of SQL injection attacks
